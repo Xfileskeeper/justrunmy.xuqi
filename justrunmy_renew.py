@@ -4,8 +4,13 @@
 import os
 import sys
 import time
+import json
+import socket
+import signal
 import subprocess
 import requests
+from typing import Optional
+from urllib.parse import urlparse, parse_qs, unquote
 from seleniumbase import SB
 
 LOGIN_URL = "https://justrunmy.app/id/Account/Login"
@@ -19,6 +24,12 @@ PASSWORD     = os.environ.get("JUSTRUNMY_PASSWORD")
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
 TG_CHAT_ID   = os.environ.get("TG_CHAT_ID")
 
+# Hysteria2 代理 URL（可选）
+HY2_PROXY_URL = os.environ.get("HY2_PROXY_URL", "")
+
+# SOCKS5 代理端口（可选，默认 51080）
+SOCKS_PORT = int(os.environ.get("SOCKS_PORT", "51080"))
+
 if not EMAIL or not PASSWORD:
     print("❌ 致命错误：未找到 JUSTRUNMY_EMAIL 或 JUSTRUNMY_PASSWORD 环境变量！")
     print("💡 请检查 GitHub Repository Secrets 是否配置正确。")
@@ -26,6 +37,153 @@ if not EMAIL or not PASSWORD:
 
 # 全局变量，用于动态保存网页上抓取到的应用名称
 DYNAMIC_APP_NAME = "未知应用"
+
+# ============================================================
+#  Hysteria2 代理模块
+# ============================================================
+class Hy2Proxy:
+    def __init__(self, url):
+        self.url = url
+        self.proc = None
+
+    def start(self):
+        if not self.url:
+            print("⚠️ 未提供 HY2_PROXY_URL")
+            return False
+
+        print("📡 启动 Hysteria2...")
+
+        u = self.url.replace("hysteria2://", "").replace("hy2://", "")
+        parsed = urlparse("scheme://" + u)
+        params = parse_qs(parsed.query)
+
+        # 处理 IPv6 地址
+        hostname = parsed.hostname
+        port = parsed.port
+
+        # IPv6 地址需要用方括号包围
+        if hostname and ':' in hostname:
+            server = f"[{hostname}]:{port}"
+        else:
+            server = f"{hostname}:{port}"
+
+        cfg = {
+            "server": server,
+            "auth": unquote(parsed.username),
+            "tls": {
+                "sni": params.get("sni", [hostname])[0],
+                "insecure": params.get("insecure", ["0"])[0] == "1",
+                "alpn": params.get("alpn", ["h3"])[0],
+            },
+            "socks5": {"listen": f"127.0.0.1:{SOCKS_PORT}"}
+        }
+
+        path = "/tmp/hy2.json"
+        with open(path, "w") as f:
+            json.dump(cfg, f)
+
+        self.proc = subprocess.Popen(
+            ["hysteria", "client", "-c", path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+            text=True
+        )
+
+        for _ in range(30):
+            time.sleep(1)
+            with socket.socket() as s:
+                if s.connect_ex(("127.0.0.1", SOCKS_PORT)) == 0:
+                    print("✅ HY2 已就绪")
+                    break
+        else:
+            print("❌ HY2 启动失败")
+            try:
+                _, stderr = self.proc.communicate(timeout=1)
+                if stderr:
+                    print(f"HY2 错误: {stderr}")
+            except Exception:
+                pass
+            return False
+
+        time.sleep(3)
+        return True
+
+    def stop(self):
+        if self.proc:
+            os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+            print("🛑 HY2 已停止")
+
+    @property
+    def proxy(self):
+        return f"socks5://127.0.0.1:{SOCKS_PORT}"
+
+
+def get_proxy_manager() -> Optional[Hy2Proxy]:
+    """
+    根据环境变量判断是否需要使用代理
+    支持的环境变量：
+      - HY2_PROXY_URL: Hysteria2 代理 URL
+    返回代理管理器或 None
+    """
+    if HY2_PROXY_URL:
+        return Hy2Proxy(HY2_PROXY_URL)
+    return None
+
+
+def mask_ip(ip: str) -> str:
+    """脱敏 IP 地址"""
+    return ip.rsplit(".", 1)[0] + ".***"
+
+
+def check_ip(proxy: Optional[str] = None) -> str:
+    """检查落地 IP，明确指出是否使用了代理"""
+    try:
+        proxies = None
+        if proxy:
+            proxies = {"http": proxy, "https": proxy}
+        r = requests.get(
+            "http://ip-api.com/json/?fields=status,query,countryCode",
+            proxies=proxies,
+            timeout=30
+        ).json()
+        if r.get("status") == "success":
+            ip_str = f"{mask_ip(r['query'])} ({r['countryCode']})"
+            mode = "✅ 代理" if proxy else "⚠️ 直连"
+            return f"{ip_str} [{mode}]"
+    except Exception:
+        pass
+    mode = "✅ 代理" if proxy else "⚠️ 直连"
+    return f"未知 IP [{mode}]"
+
+
+def start_proxy_with_retry(max_retries=3):
+    """
+    启动代理，失败时重试
+    参数: max_retries - 最大重试次数（默认 3 次）
+    返回: (proxy_manager, proxy_url) 或 (None, None)
+    """
+    proxy_manager = get_proxy_manager()
+    proxy_url = None
+
+    if not proxy_manager:
+        return None, None
+
+    for attempt in range(1, max_retries + 1):
+        print(f"🔄 尝试启动代理 ({attempt}/{max_retries})...")
+        if proxy_manager.start():
+            proxy_url = proxy_manager.proxy
+            print(f"✅ 代理已启动：{proxy_url}")
+            return proxy_manager, proxy_url
+        else:
+            if attempt < max_retries:
+                print(f"⏳ 等待 5 秒后重试...")
+                time.sleep(5)
+            else:
+                print("⚠️ 代理启动失败，继续使用直连模式")
+
+    return None, None
+
 
 # ============================================================
 #  Telegram 推送模块
@@ -392,30 +550,40 @@ def main():
     print("=" * 50)
     print("   JustRunMy.app 自动登录与续期脚本")
     print("=" * 50)
-    
-    use_proxy = os.environ.get("USE_PROXY", "false").lower() == "true"
+
+    # 启动 Hysteria2 代理（带重试），若未配置则直连
+    proxy_manager, proxy_url = start_proxy_with_retry(max_retries=5)
+
+    # 检查落地 IP
+    print(f"🔍 正在检查 IP 信息（使用代理: {bool(proxy_url)})...")
+    ip_info = check_ip(proxy_url)
+    print(f"🌐 IP 信息：{ip_info}")
+
     sb_kwargs = {"uc": True, "test": True, "headless": False}
-    
-    if use_proxy:
-        proxy_str = "http://127.0.0.1:8080"
-        print(f"🔗 挂载 Gost 代理: {proxy_str}")
-        sb_kwargs["proxy"] = proxy_str
+
+    if proxy_url:
+        print(f"🔗 挂载代理: {proxy_url}")
+        sb_kwargs["proxy"] = proxy_url
     else:
         print("🌐 未使用代理，直连访问")
-    
-    with SB(**sb_kwargs) as sb:
-        print("✅ 浏览器已启动")
-        try:
-            sb.open("https://api.ipify.org/?format=json")
-            print(f"🌐 当前出口真实 IP: {sb.get_text('body')}")
-        except Exception:
-            pass
 
-        if login(sb):
-            renew(sb)
-        else:
-            print("\n❌ 登录环节失败，终止后续续期操作。")
-            send_tg_message("❌", "登录失败", "未知")
+    try:
+        with SB(**sb_kwargs) as sb:
+            print("✅ 浏览器已启动")
+            try:
+                sb.open("https://api.ipify.org/?format=json")
+                print(f"🌐 当前出口真实 IP: {sb.get_text('body')}")
+            except Exception:
+                pass
+
+            if login(sb):
+                renew(sb)
+            else:
+                print("\n❌ 登录环节失败，终止后续续期操作。")
+                send_tg_message("❌", "登录失败", "未知")
+    finally:
+        if proxy_manager:
+            proxy_manager.stop()
 
 if __name__ == "__main__":
     main()
